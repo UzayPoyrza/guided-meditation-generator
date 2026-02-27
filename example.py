@@ -1,13 +1,15 @@
 import os
 import re
 from pathlib import Path
+from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
 from pydub import AudioSegment
 
+load_dotenv()
+
 # --- CONFIGURATION ---
-# 1. Replace with your actual ElevenLabs API Key
-API_KEY = "sk_661da7a1a3b5d68a8071ef4e5610d71b7aad8264123064e2"
+API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
 # 2. Replace with your preferred Voice ID (Found in ElevenLabs Voice Lab)
 VOICE_ID = "5MzdXfNI3TSWsCPwZFrB" 
