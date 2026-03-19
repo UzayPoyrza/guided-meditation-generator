@@ -1,6 +1,10 @@
 import os
 import re
+import json
+import base64
+import random
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
@@ -22,56 +26,199 @@ DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
 
 client = ElevenLabs(api_key=API_KEY)
 
+
 def generate_meditation(meditation_id, script_text):
-    """Generates a single meditation file and saves it to the Desktop folder."""
-    
+    """Generates a meditation MP3 with two subtitle JSONs and raw timestamp log."""
+
+    # Convert every 3rd consecutive <break> to [pause:] to prevent speed issues
+    break_pattern = re.compile(r'<break\s+time="([^"]*?)s"\s*/>')
+    def limit_breaks(text):
+        result = []
+        break_count = 0
+        last_end = 0
+        for m in break_pattern.finditer(text):
+            result.append(text[last_end:m.start()])
+            break_count += 1
+            if break_count >= 4:
+                # Convert this break to a [pause:]
+                result.append(f'[pause: {m.group(1)}]')
+                break_count = 0
+            else:
+                result.append(m.group(0))
+            last_end = m.end()
+        result.append(text[last_end:])
+        return "".join(result)
+
+    # Reset counter at each [pause:] by processing between pauses
+    pause_split = re.split(r'(\[PAUSE: \d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
+    processed_parts = []
+    for p in pause_split:
+        if re.match(r'\[PAUSE: \d+(?:\.\d+)?\]', p, flags=re.IGNORECASE) or re.match(r'\[skip_point\]', p, flags=re.IGNORECASE):
+            processed_parts.append(p)
+        else:
+            processed_parts.append(limit_breaks(p))
+    script_text = "".join(processed_parts)
+
     output_filename = f"{meditation_id}.mp3"
     final_output_path = DESKTOP_PATH / output_filename
-    
+
     final_audio = AudioSegment.empty()
-    parts = re.split(r'(\[PAUSE: \d+\])', script_text)
-    
+    # Split on [pause:] and [skip_point] tags, keeping them as separate parts
+    parts = re.split(r'(\[PAUSE: \d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
+
+    # Random start/end silence
+    start_silence = random.uniform(1.0, 3.0)
+    end_silence = random.uniform(1.0, 2.0)
+
+    final_audio += AudioSegment.silent(duration=int(start_silence * 1000))
+    cursor = start_silence  # running clock in seconds
+
+    timestamps_subtitles = []   # from ElevenLabs character-level data
+    calculated_subtitles = []   # from pydub chunk durations + pause gaps
+    raw_timestamp_log = []
+    skip_points = []            # timestamps where [skip_point] appears
+
     print(f"\n--- Processing {meditation_id} ---")
+    print(f"   - Adding {start_silence:.1f}s start silence")
 
     for part in parts:
         part = part.strip()
         if not part:
             continue
-            
-        if part.startswith("[PAUSE:"):
-            seconds = int(re.search(r'\d+', part).group())
+
+        if part.upper() == "[SKIP_POINT]":
+            skip_points.append(round(cursor, 3))
+            print(f"   - Skip point at {cursor:.1f}s")
+            continue
+
+        if part.upper().startswith("[PAUSE:"):
+            seconds = float(re.search(r'\d+(?:\.\d+)?', part).group())
             print(f"   - Adding {seconds}s silence")
-            silence = AudioSegment.silent(duration=seconds * 1000)
+            silence = AudioSegment.silent(duration=int(seconds * 1000))
             final_audio += silence
-            
+            cursor += seconds
+
         else:
-            print(f"   - Voicing segment: '{part[:30]}...'")
-            audio_generator = client.text_to_speech.convert(
+            print(f"   - Voicing segment: '{part[:40]}...'")
+            response = client.text_to_speech.convert_with_timestamps(
                 voice_id=VOICE_ID,
                 text=part,
                 model_id="eleven_multilingual_v2",
                 output_format="mp3_44100_128",
                 voice_settings=VoiceSettings(
                     speed=0.8,
-                    stability=0.95,          # Increased for meditation consistency
-                    similarity_boost=0.95,   # High clarity
-                    style=0.0,               # Neutral style for calming effect
+                    stability=0.95,
+                    similarity_boost=0.95,
+                    style=0.0,
                     use_speaker_boost=True
                 )
             )
-            
+
+            # Decode audio and append
+            audio_bytes = base64.b64decode(response.audio_base_64)
             temp_file = "temp_chunk.mp3"
             with open(temp_file, "wb") as f:
-                for chunk in audio_generator:
-                    f.write(chunk)
-            
+                f.write(audio_bytes)
             voice_chunk = AudioSegment.from_file(temp_file, format="mp3")
             final_audio += voice_chunk
             os.remove(temp_file)
 
-    # Export to the Desktop folder
+            # --- Calculated subtitles: one per chunk, breaks become \n ---
+            calc_text = re.sub(r'<break\s+time="[^"]*"\s*/>', '\n', part)
+            calc_text = re.sub(r'\n{2,}', '\n', calc_text).strip()
+            if calc_text:
+                calculated_subtitles.append({"start": round(cursor, 3), "text": calc_text})
+
+            # --- ElevenLabs timestamp subtitles: split on breaks ---
+            if response.alignment:
+                raw_timestamp_log.append({
+                    "segment_text": part,
+                    "offset": round(cursor, 3),
+                    "characters": response.alignment.characters,
+                    "character_start_times": response.alignment.character_start_times_seconds,
+                    "character_end_times": response.alignment.character_end_times_seconds
+                })
+
+                sub_segments = re.split(r'<break\s+time="[^"]*"\s*/>', part)
+                chars = response.alignment.characters
+                starts = response.alignment.character_start_times_seconds
+                ends = response.alignment.character_end_times_seconds
+
+                # Break tag chars have zero duration (start == end)
+                is_spoken = [starts[i] != ends[i] or chars[i] in (" ", "\n", "\r", "\t")
+                             for i in range(len(chars))]
+
+                char_idx = 0
+                for seg in sub_segments:
+                    clean_text = re.sub(r'\s+', ' ', seg).strip()
+                    if not clean_text:
+                        continue
+
+                    # Skip non-spoken chars (break tags) and whitespace
+                    while char_idx < len(chars) and not is_spoken[char_idx]:
+                        char_idx += 1
+                    while char_idx < len(chars) and chars[char_idx] in (" ", "\n", "\r", "\t"):
+                        char_idx += 1
+
+                    if char_idx < len(chars):
+                        seg_start = round(starts[char_idx] + cursor, 3)
+                    else:
+                        seg_start = round(cursor, 3)
+
+                    timestamps_subtitles.append({"start": seg_start, "text": clean_text})
+
+                    # Advance past this segment's spoken characters
+                    seg_stripped = re.sub(r'\s+', '', clean_text)
+                    matched = 0
+                    while char_idx < len(chars) and matched < len(seg_stripped):
+                        if chars[char_idx] not in (" ", "\n", "\r", "\t") and is_spoken[char_idx]:
+                            matched += 1
+                        char_idx += 1
+
+            chunk_duration = len(voice_chunk) / 1000.0
+            cursor += chunk_duration
+
+    # End silence
+    print(f"   - Adding {end_silence:.1f}s end silence")
+    final_audio += AudioSegment.silent(duration=int(end_silence * 1000))
+
+    # Mark end time on last subtitle of each type
+    if timestamps_subtitles:
+        timestamps_subtitles[-1]["end"] = round(cursor, 3)
+    if calculated_subtitles:
+        calculated_subtitles[-1]["end"] = round(cursor, 3)
+
+    cursor += end_silence
+
+    # Export MP3
     final_audio.export(str(final_output_path), format="mp3", bitrate="192k")
     print(f"✅ COMPLETED: {output_filename} saved to Desktop/meditation_audio")
+
+    # Export ElevenLabs timestamp subtitles
+    ts_path = DESKTOP_PATH / f"{meditation_id}_timestamps.json"
+    with open(ts_path, "w") as f:
+        json.dump({"subtitles": timestamps_subtitles, "skip_points": skip_points}, f, indent=2)
+    print(f"📝 Timestamp subtitles saved to: {ts_path}")
+
+    # Export calculated subtitles
+    calc_path = DESKTOP_PATH / f"{meditation_id}_calculated.json"
+    with open(calc_path, "w") as f:
+        json.dump({"subtitles": calculated_subtitles, "skip_points": skip_points}, f, indent=2)
+    print(f"📝 Calculated subtitles saved to: {calc_path}")
+
+    # Append to session raw timestamp log
+    log_path = DESKTOP_PATH / "session_timestamp_log.md"
+    with open(log_path, "a") as f:
+        f.write(f"\n## {meditation_id} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Start silence: {start_silence:.3f}s | End silence: {end_silence:.3f}s\n\n")
+        for entry in raw_timestamp_log:
+            f.write(f"### Segment (offset {entry['offset']}s)\n")
+            f.write(f"**Text:** {entry['segment_text'][:100]}...\n\n")
+            f.write("| Char | Start | End |\n|------|-------|-----|\n")
+            for i, char in enumerate(entry["characters"]):
+                f.write(f"| `{char}` | {entry['character_start_times'][i]:.3f} | {entry['character_end_times'][i]:.3f} |\n")
+            f.write("\n")
+    print(f"📋 Raw timestamps appended to: {log_path}")
 
 # --- YOUR DATA LIST ---
 # Add your 120 meditations here following this format
@@ -595,8 +742,29 @@ Eyes open when ready. [PAUSE: 2]
 }
 ]
 
+def test_tts(script_text):
+    """Generates a test MP3 from the given script text (with pause support) and saves to Desktop."""
+    # Find next available test_output number
+    if not (DESKTOP_PATH / "test_output.mp3").exists():
+        name = "test_output"
+    else:
+        n = 2
+        while (DESKTOP_PATH / f"test_output_{n}.mp3").exists():
+            n += 1
+        name = f"test_output_{n}"
+    generate_meditation(name, script_text)
+    print(f"\n🎧 Test audio saved to: {DESKTOP_PATH / f'{name}.mp3'}")
+
+
 if __name__ == "__main__":
-    for item in meditations_to_process:
-        generate_meditation(item["id"], item["script"])
-    
-    print("\n🎉 All meditations in the list have been processed!")
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_script = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else None
+        if test_script:
+            test_tts(test_script)
+        else:
+            print("Usage: python generate_voice.py --test \"your script text here\"")
+    else:
+        for item in meditations_to_process:
+            generate_meditation(item["id"], item["script"])
+        print("\n🎉 All meditations in the list have been processed!")
