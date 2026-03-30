@@ -13,10 +13,10 @@ import tempfile
 from pathlib import Path
 from pydub import AudioSegment
 
-MUSIC_DIR = Path.home() / "Desktop" / "trimmed_meditations"
+MUSIC_DIR = Path.home() / "Desktop" / "formatted_music"
 OUTPUT_DIR = Path.home() / "Desktop" / "logic_roundtrip"
 MANIFEST_PATH = OUTPUT_DIR / "music_manifest.json"
-SEPARATOR_MS = 1000
+SEPARATOR_MS = 5000  # 5s gap — enough for mastering reverb/compressor tails to decay
 
 
 def concat():
@@ -29,56 +29,60 @@ def concat():
 
     print(f"Found {len(music_files)} music tracks\n")
 
-    # Generate silence separator
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        silence_path = tmp.name
-    AudioSegment.silent(duration=SEPARATOR_MS).export(silence_path, format="wav")
-
-    # Probe durations and build concat list
+    # Load all files into pydub for sample-accurate concatenation
     manifest = []
+    combined = AudioSegment.empty()
     offset_ms = 0
+    separator = AudioSegment.silent(duration=SEPARATOR_MS)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        for mf in music_files:
-            result = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(mf)],
-                capture_output=True, text=True,
-            )
-            duration_ms = int(float(result.stdout.strip()) * 1000)
-            code = mf.stem.split("_")[0]
+    for mf in music_files:
+        code = mf.stem
+        audio = AudioSegment.from_file(str(mf))
+        duration_ms = len(audio)
 
-            manifest.append({
-                "music_code": code,
-                "filename": mf.name,
-                "offset_ms": offset_ms,
-                "duration_ms": duration_ms,
-            })
-            print(f"  {mf.name} | {duration_ms / 1000:.1f}s | offset: {offset_ms / 1000:.1f}s")
+        manifest.append({
+            "music_code": code,
+            "filename": mf.name,
+            "offset_ms": offset_ms,
+            "duration_ms": duration_ms,
+        })
+        print(f"  {mf.name} | {duration_ms / 1000:.1f}s | offset: {offset_ms / 1000:.1f}s")
 
-            f.write(f"file '{mf}'\n")
-            f.write(f"file '{silence_path}'\n")
-            offset_ms += duration_ms + SEPARATOR_MS
+        combined += audio + separator
+        offset_ms += duration_ms + SEPARATOR_MS
 
-        concat_list = f.name
-
-    # Concat via ffmpeg → CAF (no 4GB limit)
+    # Export to temp WAV, then convert to CAF via ffmpeg (WAV has 4GB limit)
     out_path = OUTPUT_DIR / "combined_music.caf"
-    print(f"\nConcatenating → {out_path}")
+    print(f"\nExporting → {out_path} ({len(combined) / 1000 / 60:.1f} min)")
+
+    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
+        tmp_raw = tmp.name
+
+    # Export raw PCM from pydub, then wrap in CAF via ffmpeg
+    combined.export(tmp_raw, format="raw")
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-         "-i", concat_list, "-c:a", "pcm_s24le", str(out_path)],
+        ["ffmpeg", "-y",
+         "-f", "s16le", "-ar", str(combined.frame_rate),
+         "-ac", str(combined.channels),
+         "-i", tmp_raw,
+         "-c:a", "pcm_s24le", str(out_path)],
         check=True, capture_output=True,
     )
+    Path(tmp_raw).unlink()
 
-    Path(silence_path).unlink()
-    Path(concat_list).unlink()
+    # Verify duration matches
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(out_path)],
+        capture_output=True, text=True,
+    )
+    actual_s = float(result.stdout.strip())
+    expected_s = offset_ms / 1000
+    print(f"  Expected: {expected_s:.1f}s | Actual: {actual_s:.1f}s | Diff: {abs(actual_s - expected_s):.3f}s")
 
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    total_min = offset_ms / 1000 / 60
-    print(f"  Total: {total_min:.1f} min")
     print(f"  Manifest: {MANIFEST_PATH}")
     print(f"\nImport {out_path} into Logic Pro, apply UZAYMEDMUSIC.cst, bounce as WAV/CAF.")
     print(f"Then run: python concat_music.py split <processed_file>")
@@ -98,17 +102,20 @@ def split(processed_path):
 
     print(f"Splitting: {processed_path}\n")
 
-    for entry in manifest:
+    FADE_IN_S = 0.5  # gentle fade-in to mask any mastering bleed from previous track
+
+    for i, entry in enumerate(manifest):
         start_s = entry["offset_ms"] / 1000
         duration_s = entry["duration_ms"] / 1000
-        out_path = out_dir / f"{entry['music_code']}.wav"
+        out_path = out_dir / entry["filename"]
 
         subprocess.run(
             ["ffmpeg", "-y",
              "-i", str(processed_path),
              "-ss", f"{start_s:.3f}",
              "-t", f"{duration_s:.3f}",
-             "-c:a", "pcm_s24le",
+             "-af", f"afade=t=in:d={FADE_IN_S}",
+             "-codec:a", "libmp3lame", "-b:a", "320k",
              str(out_path)],
             check=True, capture_output=True,
         )

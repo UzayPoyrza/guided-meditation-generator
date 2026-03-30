@@ -21,7 +21,7 @@ from pedalboard import (
 # --- CONFIGURATION ---
 JSON_PATH = Path.home() / "Desktop" / "neurotype_meditations_150.json"
 VOICE_DIR = Path.home() / "Desktop" / "meditation_audio"
-MUSIC_DIR = Path.home() / "Desktop" / "trimmed_meditations"
+MUSIC_DIR = Path.home() / "Desktop" / "formatted_music"
 FINAL_DIR = Path.home() / "Desktop" / "final_meditations"
 STAGES_DIR = Path.home() / "Desktop" / "meditation_stages"
 
@@ -43,11 +43,15 @@ def load_metadata():
 
 
 def find_music_file(audio_code):
-    """Auto-map audio code like 'T16' to 'T16_15min.mp3' by globbing."""
-    pattern = str(MUSIC_DIR / f"{audio_code}_*.mp3")
+    """Auto-map audio code to music file in formatted_music directory."""
+    # Try exact match first, then glob with wildcard
+    exact = MUSIC_DIR / f"{audio_code}.mp3"
+    if exact.exists():
+        return exact
+    pattern = str(MUSIC_DIR / f"{audio_code}*.mp3")
     matches = glob.glob(pattern)
     if not matches:
-        raise FileNotFoundError(f"No music file found for pattern: {pattern}")
+        raise FileNotFoundError(f"No music file found for '{audio_code}' in {MUSIC_DIR}")
     return Path(matches[0])
 
 

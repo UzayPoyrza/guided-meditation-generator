@@ -1,0 +1,5 @@
+elevenlabs==2.33.1
+pydub
+requests
+boto3
+python-dotenv

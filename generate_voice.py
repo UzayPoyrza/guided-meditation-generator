@@ -27,8 +27,30 @@ DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
 client = ElevenLabs(api_key=API_KEY)
 
 
-def generate_meditation(meditation_id, script_text):
-    """Generates a meditation MP3 with two subtitle JSONs and raw timestamp log."""
+def normalize_pause_tags(script_text):
+    """Catch malformed pause tags from LLM output and normalize to [PAUSE: N].
+
+    Handles: <pause: N>, <pause:N>, <pause:N], [pause:N>, (pause: N),
+    angle/square bracket mismatches, missing spaces, etc.
+    """
+    pattern = re.compile(
+        r'[\[<(]\s*pause\s*[:;]\s*(\d+(?:\.\d+)?)\s*[\]>)]',
+        re.IGNORECASE,
+    )
+    return pattern.sub(r'[PAUSE: \1]', script_text)
+
+
+def generate_meditation(meditation_id, script_text, output_dir=None):
+    """Generates a meditation MP3 with two subtitle JSONs and raw timestamp log.
+
+    If output_dir is provided, all files are saved there instead of DESKTOP_PATH.
+    Returns a dict with paths to all generated files.
+    """
+    out = Path(output_dir) if output_dir else DESKTOP_PATH
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Normalize malformed pause tags
+    script_text = normalize_pause_tags(script_text)
 
     # Convert every 3rd consecutive <break> to [pause:] to prevent speed issues
     break_pattern = re.compile(r'<break\s+time="([^"]*?)s"\s*/>')
@@ -50,21 +72,21 @@ def generate_meditation(meditation_id, script_text):
         return "".join(result)
 
     # Reset counter at each [pause:] by processing between pauses
-    pause_split = re.split(r'(\[PAUSE: \d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
+    pause_split = re.split(r'(\[PAUSE:\s*\d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
     processed_parts = []
     for p in pause_split:
-        if re.match(r'\[PAUSE: \d+(?:\.\d+)?\]', p, flags=re.IGNORECASE) or re.match(r'\[skip_point\]', p, flags=re.IGNORECASE):
+        if re.match(r'\[PAUSE:\s*\d+(?:\.\d+)?\]', p, flags=re.IGNORECASE) or re.match(r'\[skip_point\]', p, flags=re.IGNORECASE):
             processed_parts.append(p)
         else:
             processed_parts.append(limit_breaks(p))
     script_text = "".join(processed_parts)
 
     output_filename = f"{meditation_id}.mp3"
-    final_output_path = DESKTOP_PATH / output_filename
+    final_output_path = out / output_filename
 
     final_audio = AudioSegment.empty()
     # Split on [pause:] and [skip_point] tags, keeping them as separate parts
-    parts = re.split(r'(\[PAUSE: \d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
+    parts = re.split(r'(\[PAUSE:\s*\d+(?:\.\d+)?\]|\[skip_point\])', script_text, flags=re.IGNORECASE)
 
     # Random start/end silence
     start_silence = random.uniform(1.0, 3.0)
@@ -192,22 +214,22 @@ def generate_meditation(meditation_id, script_text):
 
     # Export MP3
     final_audio.export(str(final_output_path), format="mp3", bitrate="192k")
-    print(f"✅ COMPLETED: {output_filename} saved to Desktop/meditation_audio")
+    print(f"✅ COMPLETED: {output_filename} saved to {out}")
 
     # Export ElevenLabs timestamp subtitles
-    ts_path = DESKTOP_PATH / f"{meditation_id}_timestamps.json"
+    ts_path = out / f"{meditation_id}_timestamps.json"
     with open(ts_path, "w") as f:
         json.dump({"subtitles": timestamps_subtitles, "skip_points": skip_points}, f, indent=2)
     print(f"📝 Timestamp subtitles saved to: {ts_path}")
 
     # Export calculated subtitles
-    calc_path = DESKTOP_PATH / f"{meditation_id}_calculated.json"
+    calc_path = out / f"{meditation_id}_calculated.json"
     with open(calc_path, "w") as f:
         json.dump({"subtitles": calculated_subtitles, "skip_points": skip_points}, f, indent=2)
     print(f"📝 Calculated subtitles saved to: {calc_path}")
 
     # Append to session raw timestamp log
-    log_path = DESKTOP_PATH / "session_timestamp_log.md"
+    log_path = out / f"{meditation_id}_session_log.md"
     with open(log_path, "a") as f:
         f.write(f"\n## {meditation_id} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"Start silence: {start_silence:.3f}s | End silence: {end_silence:.3f}s\n\n")
@@ -219,6 +241,13 @@ def generate_meditation(meditation_id, script_text):
                 f.write(f"| `{char}` | {entry['character_start_times'][i]:.3f} | {entry['character_end_times'][i]:.3f} |\n")
             f.write("\n")
     print(f"📋 Raw timestamps appended to: {log_path}")
+
+    return {
+        "mp3": final_output_path,
+        "timestamps": ts_path,
+        "calculated": calc_path,
+        "log": log_path,
+    }
 
 # --- YOUR DATA LIST ---
 # Add your 120 meditations here following this format
